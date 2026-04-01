@@ -7,7 +7,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import yaml
-from craftax.environment_base.wrappers import AutoResetEnvWrapper
 from flax.training.train_state import TrainState
 from orbax.checkpoint import (
     PyTreeCheckpointer,
@@ -16,7 +15,9 @@ from orbax.checkpoint import (
 )
 import orbax.checkpoint as ocp
 
+from checkpointing import resolve_checkpoint_dir
 from models.actor_critic import ActorCriticConv, ActorCritic
+from wrappers import AutoResetEnvWrapper
 
 
 def main(args):
@@ -33,8 +34,9 @@ def main(args):
 
     orbax_checkpointer = PyTreeCheckpointer()
     options = CheckpointManagerOptions(max_to_keep=1, create=True)
+    checkpoint_dir = resolve_checkpoint_dir(args.path, "policies")
     checkpoint_manager = CheckpointManager(
-        os.path.join(args.path, "policies"), orbax_checkpointer, options
+        checkpoint_dir, orbax_checkpointer, options
     )
 
     is_classic = False

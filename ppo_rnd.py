@@ -20,6 +20,7 @@ from orbax.checkpoint import (
     CheckpointManager,
 )
 
+from checkpointing import get_checkpoint_dir, record_checkpoint_reference
 from logz.batch_logging import batch_log, create_log_dict
 from wrappers import (
     LogWrapper,
@@ -554,7 +555,7 @@ def make_train(config):
 def run_ppo(config):
     config = {k.upper(): v for k, v in config.__dict__.items()}
 
-    if config["USE_WANDB"]:
+    if config["SAVE_POLICY"]:
         wandb.init(
             project=config["WANDB_PROJECT"],
             entity=config["WANDB_ENTITY"],
@@ -600,7 +601,9 @@ def run_ppo(config):
             train_state = jax.tree.map(lambda x: x[0], train_states)
             orbax_checkpointer = PyTreeCheckpointer()
             options = CheckpointManagerOptions(max_to_keep=1, create=True)
-            path = os.path.join(wandb.run.dir, dir_name)
+            path = get_checkpoint_dir(config, dir_name)
+            os.makedirs(path, exist_ok=True)
+            record_checkpoint_reference(path, dir_name)
             checkpoint_manager = CheckpointManager(path, orbax_checkpointer, options)
             print(f"saved runner state to {path}")
             save_args = orbax_utils.save_args_from_target(train_state)
@@ -609,6 +612,8 @@ def run_ppo(config):
                 train_state,
                 save_kwargs={"save_args": save_args},
             )
+            if hasattr(checkpoint_manager, "wait_until_finished"):
+                checkpoint_manager.wait_until_finished()
 
         if config["SAVE_POLICY"]:
             _save_network(0, "policies")
@@ -645,9 +650,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_wandb", action=argparse.BooleanOptionalAction, default=True
     )
-    parser.add_argument("--save_policy", action="store_true")
+    parser.add_argument(
+        "--save_policy", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--num_repeats", type=int, default=1)
     parser.add_argument("--layer_size", type=int, default=512)
+    parser.add_argument("--checkpoint_root", type=str)
     parser.add_argument("--wandb_project", type=str)
     parser.add_argument("--wandb_entity", type=str)
     parser.add_argument(

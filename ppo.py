@@ -20,6 +20,7 @@ from orbax.checkpoint import (
     CheckpointManager,
 )
 
+from checkpointing import get_checkpoint_dir, record_checkpoint_reference
 from logz.batch_logging import batch_log, create_log_dict
 from models.actor_critic import (
     ActorCritic,
@@ -505,12 +506,14 @@ def make_train(config):
                         grads=icm_inverse_grad
                     )
 
-                    def _forward_loss_fn(icm_forward_params, traj_batch):
+                    def _forward_loss_fn(
+                        icm_encoder_params, icm_forward_params, traj_batch
+                    ):
                         latent_obs = ex_state["icm_encoder"].apply_fn(
-                            ex_state["icm_encoder"].params, traj_batch.obs
+                            icm_encoder_params, traj_batch.obs
                         )
                         latent_next_obs = ex_state["icm_encoder"].apply_fn(
-                            ex_state["icm_encoder"].params, traj_batch.next_obs
+                            icm_encoder_params, traj_batch.next_obs
                         )
 
                         latent_next_obs_pred = ex_state["icm_forward"].apply_fn(
@@ -525,10 +528,20 @@ def make_train(config):
                         )
 
                     forward_grad_fn = jax.value_and_grad(
-                        _forward_loss_fn, has_aux=False
+                        _forward_loss_fn,
+                        has_aux=False,
+                        argnums=(
+                            0,
+                            1,
+                        ),
                     )
-                    forward_loss, icm_forward_grad = forward_grad_fn(
+                    forward_loss, grads = forward_grad_fn(
+                        ex_state["icm_encoder"].params,
                         ex_state["icm_forward"].params, traj_batch
+                    )
+                    icm_encoder_grad, icm_forward_grad = grads
+                    ex_state["icm_encoder"] = ex_state["icm_encoder"].apply_gradients(
+                        grads=icm_encoder_grad
                     )
                     ex_state["icm_forward"] = ex_state["icm_forward"].apply_gradients(
                         grads=icm_forward_grad
@@ -644,14 +657,16 @@ def run_ppo(config):
     print("Time to run experiment", t1 - t0)
     print("SPS: ", config["TOTAL_TIMESTEPS"] / (t1 - t0))
 
-    if config["USE_WANDB"]:
+    if config["SAVE_POLICY"]:
 
         def _save_network(rs_index, dir_name):
             train_states = out["runner_state"][rs_index]
             train_state = jax.tree.map(lambda x: x[0], train_states)
             orbax_checkpointer = PyTreeCheckpointer()
             options = CheckpointManagerOptions(max_to_keep=1, create=True)
-            path = os.path.join(wandb.run.dir, dir_name)
+            path = get_checkpoint_dir(config, dir_name)
+            os.makedirs(path, exist_ok=True)
+            record_checkpoint_reference(path, dir_name)
             checkpoint_manager = CheckpointManager(path, orbax_checkpointer, options)
             print(f"saved runner state to {path}")
             save_args = orbax_utils.save_args_from_target(train_state)
@@ -660,6 +675,8 @@ def run_ppo(config):
                 train_state,
                 save_kwargs={"save_args": save_args},
             )
+            if hasattr(checkpoint_manager, "wait_until_finished"):
+                checkpoint_manager.wait_until_finished()
 
         if config["SAVE_POLICY"]:
             _save_network(0, "policies")
@@ -696,9 +713,12 @@ if __name__ == "__main__":
     parser.add_argument(
         "--use_wandb", action=argparse.BooleanOptionalAction, default=True
     )
-    parser.add_argument("--save_policy", action="store_true")
+    parser.add_argument(
+        "--save_policy", action=argparse.BooleanOptionalAction, default=True
+    )
     parser.add_argument("--num_repeats", type=int, default=1)
     parser.add_argument("--layer_size", type=int, default=512)
+    parser.add_argument("--checkpoint_root", type=str)
     parser.add_argument("--wandb_project", type=str)
     parser.add_argument("--wandb_entity", type=str)
     parser.add_argument(
