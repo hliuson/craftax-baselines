@@ -51,10 +51,12 @@ def batch_log(update_step, log, config):
             else:
                 for i in range(config["NUM_REPEATS"]):
                     val = batch_logs[update_step][i][key]
-                    if not jnp.isnan(val):
+                    val_arr = np.asarray(val)
+                    if not np.isnan(val_arr).any():
                         agg.append(val)
 
             if len(agg) > 0:
+                scalar_like = np.asarray(agg[0]).shape == ()
                 if key in [
                     "episode_length",
                     "episode_return",
@@ -62,7 +64,7 @@ def batch_log(update_step, log, config):
                     "e_mean",
                     "e_std",
                     "rnd_loss",
-                ]:
+                ] or scalar_like:
                     agg_logs[key] = np.mean(agg)
                 else:
                     agg_logs[key] = np.array(agg)

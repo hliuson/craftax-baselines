@@ -31,6 +31,7 @@ from wrappers import (
     AutoResetEnvWrapper,
 )
 from logz.batch_logging import create_log_dict, batch_log
+from models.latent_regularizers import sliced_epps_pulley_loss
 
 from craftax.craftax_env import make_craftax_env_from_name
 
@@ -94,12 +95,12 @@ class ActorCriticRNN(nn.Module):
             kernel_init=orthogonal(2),
             bias_init=constant(0.0),
         )(actor_mean)
-        actor_mean = nn.relu(actor_mean)
-        actor_mean = nn.Dense(
+        actor_penultimate = nn.relu(actor_mean)
+        actor_logits = nn.Dense(
             self.action_dim, kernel_init=orthogonal(0.01), bias_init=constant(0.0)
-        )(actor_mean)
+        )(actor_penultimate)
 
-        pi = distrax.Categorical(logits=actor_mean)
+        pi = distrax.Categorical(logits=actor_logits)
 
         critic = nn.Dense(
             self.config["LAYER_SIZE"],
@@ -112,12 +113,19 @@ class ActorCriticRNN(nn.Module):
             kernel_init=orthogonal(2),
             bias_init=constant(0.0),
         )(critic)
-        critic = nn.relu(critic)
+        critic_penultimate = nn.relu(critic)
         critic = nn.Dense(1, kernel_init=orthogonal(1.0), bias_init=constant(0.0))(
-            critic
+            critic_penultimate
         )
 
-        return hidden, pi, jnp.squeeze(critic, axis=-1)
+        return (
+            hidden,
+            pi,
+            jnp.squeeze(critic, axis=-1),
+            embedding,
+            actor_penultimate,
+            critic_penultimate,
+        )
 
 
 class Transition(NamedTuple):
@@ -220,7 +228,9 @@ def make_train(config):
 
                 # SELECT ACTION
                 ac_in = (last_obs[np.newaxis, :], last_done[np.newaxis, :])
-                hstate, pi, value = network.apply(train_state.params, hstate, ac_in)
+                hstate, pi, value, _, _, _ = network.apply(
+                    train_state.params, hstate, ac_in
+                )
                 action = pi.sample(seed=_rng)
                 log_prob = pi.log_prob(action)
                 value, action, log_prob = (
@@ -235,7 +245,13 @@ def make_train(config):
                     _rng, env_state, action, env_params
                 )
                 transition = Transition(
-                    last_done, action, value, reward, log_prob, last_obs, info
+                    done=last_done,
+                    action=action,
+                    value=value,
+                    reward=reward,
+                    log_prob=log_prob,
+                    obs=last_obs,
+                    info=info,
                 )
                 runner_state = (
                     train_state,
@@ -264,7 +280,7 @@ def make_train(config):
                 update_step,
             ) = runner_state
             ac_in = (last_obs[np.newaxis, :], last_done[np.newaxis, :])
-            _, _, last_val = network.apply(train_state.params, hstate, ac_in)
+            _, _, last_val, _, _, _ = network.apply(train_state.params, hstate, ac_in)
             last_val = last_val.squeeze(0)
 
             def _calculate_gae(traj_batch, last_val, last_done):
@@ -298,11 +314,21 @@ def make_train(config):
             # UPDATE NETWORK
             def _update_epoch(update_state, unused):
                 def _update_minbatch(train_state, batch_info):
-                    init_hstate, traj_batch, advantages, targets = batch_info
+                    minibatch, sigreg_rng = batch_info
+                    init_hstate, traj_batch, advantages, targets = minibatch
 
-                    def _loss_fn(params, init_hstate, traj_batch, gae, targets):
+                    def _loss_fn(
+                        params, init_hstate, traj_batch, gae, targets, sigreg_rng
+                    ):
                         # RERUN NETWORK
-                        _, pi, value = network.apply(
+                        (
+                            _,
+                            pi,
+                            value,
+                            shared_hidden,
+                            actor_penultimate,
+                            critic_penultimate,
+                        ) = network.apply(
                             params, init_hstate[0], (traj_batch.obs, traj_batch.done)
                         )
                         log_prob = pi.log_prob(traj_batch.action)
@@ -333,19 +359,107 @@ def make_train(config):
                         loss_actor = loss_actor.mean()
                         entropy = pi.entropy().mean()
 
+                        sigreg_hidden_loss = jnp.asarray(0.0, dtype=value_loss.dtype)
+                        sigreg_actor_loss = jnp.asarray(0.0, dtype=value_loss.dtype)
+                        sigreg_critic_loss = jnp.asarray(0.0, dtype=value_loss.dtype)
+                        sigreg_z_mean = jnp.asarray(0.0, dtype=value_loss.dtype)
+                        sigreg_z_std = jnp.asarray(0.0, dtype=value_loss.dtype)
+                        if config["SIGREG_COEF"] > 0:
+                            hidden_rng, actor_rng, critic_rng = jax.random.split(
+                                sigreg_rng, 3
+                            )
+
+                            if config["SIGREG_TARGET"] == "hidden":
+                                shared_hidden_flat = shared_hidden.reshape(
+                                    (-1, shared_hidden.shape[-1])
+                                )
+                                sigreg_z_mean = shared_hidden_flat.mean()
+                                sigreg_z_std = shared_hidden_flat.std()
+                                sigreg_hidden_loss = sliced_epps_pulley_loss(
+                                    shared_hidden_flat,
+                                    hidden_rng,
+                                    num_slices=int(config["SIGREG_NUM_SLICES"]),
+                                    reduction="mean",
+                                )
+
+                            if config["SIGREG_TARGET"] in ("actor", "both"):
+                                actor_penultimate_flat = actor_penultimate.reshape(
+                                    (-1, actor_penultimate.shape[-1])
+                                )
+                                if config["SIGREG_TARGET"] == "actor":
+                                    sigreg_z_mean = actor_penultimate_flat.mean()
+                                    sigreg_z_std = actor_penultimate_flat.std()
+                                sigreg_actor_loss = sliced_epps_pulley_loss(
+                                    actor_penultimate_flat,
+                                    actor_rng,
+                                    num_slices=int(config["SIGREG_NUM_SLICES"]),
+                                    reduction="mean",
+                                )
+
+                            if config["SIGREG_TARGET"] in ("critic", "both"):
+                                critic_penultimate_flat = critic_penultimate.reshape(
+                                    (-1, critic_penultimate.shape[-1])
+                                )
+                                if config["SIGREG_TARGET"] == "critic":
+                                    sigreg_z_mean = critic_penultimate_flat.mean()
+                                    sigreg_z_std = critic_penultimate_flat.std()
+                                sigreg_critic_loss = sliced_epps_pulley_loss(
+                                    critic_penultimate_flat,
+                                    critic_rng,
+                                    num_slices=int(config["SIGREG_NUM_SLICES"]),
+                                    reduction="mean",
+                                )
+
+                            if config["SIGREG_TARGET"] == "both":
+                                sigreg_z = jnp.concatenate(
+                                    [actor_penultimate_flat, critic_penultimate_flat],
+                                    axis=0,
+                                )
+                                sigreg_z_mean = sigreg_z.mean()
+                                sigreg_z_std = sigreg_z.std()
+
+                        if config["SIGREG_TARGET"] == "hidden":
+                            sigreg_loss = sigreg_hidden_loss
+                        elif config["SIGREG_TARGET"] == "critic":
+                            sigreg_loss = sigreg_critic_loss
+                        elif config["SIGREG_TARGET"] == "both":
+                            sigreg_loss = 0.5 * (
+                                sigreg_actor_loss + sigreg_critic_loss
+                            )
+                        else:
+                            sigreg_loss = sigreg_actor_loss
+
                         total_loss = (
                             loss_actor
                             + config["VF_COEF"] * value_loss
                             - config["ENT_COEF"] * entropy
+                            + config["SIGREG_COEF"] * sigreg_loss
                         )
-                        return total_loss, (value_loss, loss_actor, entropy)
+                        loss_stats = {
+                            "total_loss": total_loss,
+                            "value_loss": value_loss,
+                            "actor_loss": loss_actor,
+                            "policy_entropy": entropy,
+                            "sigreg_loss": sigreg_loss,
+                            "sigreg_hidden_loss": sigreg_hidden_loss,
+                            "sigreg_actor_loss": sigreg_actor_loss,
+                            "sigreg_critic_loss": sigreg_critic_loss,
+                            "z_mean": sigreg_z_mean,
+                            "z_std": sigreg_z_std,
+                        }
+                        return total_loss, loss_stats
 
                     grad_fn = jax.value_and_grad(_loss_fn, has_aux=True)
-                    total_loss, grads = grad_fn(
-                        train_state.params, init_hstate, traj_batch, advantages, targets
+                    (total_loss, loss_stats), grads = grad_fn(
+                        train_state.params,
+                        init_hstate,
+                        traj_batch,
+                        advantages,
+                        targets,
+                        sigreg_rng,
                     )
                     train_state = train_state.apply_gradients(grads=grads)
-                    return train_state, total_loss
+                    return train_state, loss_stats
 
                 (
                     train_state,
@@ -356,8 +470,8 @@ def make_train(config):
                     rng,
                 ) = update_state
 
-                rng, _rng = jax.random.split(rng)
-                permutation = jax.random.permutation(_rng, config["NUM_ENVS"])
+                rng, perm_rng, sigreg_rng = jax.random.split(rng, 3)
+                permutation = jax.random.permutation(perm_rng, config["NUM_ENVS"])
                 batch = (init_hstate, traj_batch, advantages, targets)
 
                 shuffled_batch = jax.tree.map(
@@ -376,9 +490,14 @@ def make_train(config):
                     ),
                     shuffled_batch,
                 )
+                minibatch_sigreg_rngs = jax.random.split(
+                    sigreg_rng, config["NUM_MINIBATCHES"]
+                )
 
-                train_state, total_loss = jax.lax.scan(
-                    _update_minbatch, train_state, minibatches
+                train_state, loss_stats = jax.lax.scan(
+                    _update_minbatch,
+                    train_state,
+                    (minibatches, minibatch_sigreg_rngs),
                 )
                 update_state = (
                     train_state,
@@ -388,7 +507,7 @@ def make_train(config):
                     targets,
                     rng,
                 )
-                return update_state, total_loss
+                return update_state, loss_stats
 
             init_hstate = initial_hstate[None, :]  # TBH
             update_state = (
@@ -403,16 +522,30 @@ def make_train(config):
                 _update_epoch, update_state, None, config["UPDATE_EPOCHS"]
             )
             train_state = update_state[0]
-            metric = jax.tree.map(
+
+            env_metric = jax.tree.map(
                 lambda x: (x * traj_batch.info["returned_episode"]).sum()
                 / traj_batch.info["returned_episode"].sum(),
                 traj_batch.info,
             )
+            loss_metric = jax.tree.map(lambda x: x.mean(), loss_info)
+            metric = {**env_metric, **loss_metric}
             rng = update_state[-1]
             if config["DEBUG"] and config["USE_WANDB"]:
 
                 def callback(metric, update_step):
                     to_log = create_log_dict(metric, config)
+                    to_log["total_loss"] = metric["total_loss"]
+                    to_log["value_loss"] = metric["value_loss"]
+                    to_log["actor_loss"] = metric["actor_loss"]
+                    to_log["policy_entropy"] = metric["policy_entropy"]
+                    if config["SIGREG_COEF"] > 0:
+                        to_log["sigreg_loss"] = metric["sigreg_loss"]
+                        to_log["sigreg_hidden_loss"] = metric["sigreg_hidden_loss"]
+                        to_log["sigreg_actor_loss"] = metric["sigreg_actor_loss"]
+                        to_log["sigreg_critic_loss"] = metric["sigreg_critic_loss"]
+                        to_log["z_mean"] = metric["z_mean"]
+                        to_log["z_std"] = metric["z_std"]
                     batch_log(update_step, to_log, config)
 
                 jax.debug.callback(callback, metric, update_step)
@@ -531,6 +664,14 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_repeats", type=int, default=1)
     parser.add_argument("--layer_size", type=int, default=512)
+    parser.add_argument("--sigreg_coef", type=float, default=0.0)
+    parser.add_argument("--sigreg_num_slices", type=int, default=32)
+    parser.add_argument(
+        "--sigreg_target",
+        type=str,
+        choices=["hidden", "actor", "critic", "both"],
+        default="hidden",
+    )
     parser.add_argument("--checkpoint_root", type=str)
     parser.add_argument("--wandb_project", type=str)
     parser.add_argument("--wandb_entity", type=str)
