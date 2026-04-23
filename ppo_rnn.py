@@ -386,10 +386,13 @@ def make_train(config):
                                 sigreg_rng, 3
                             )
 
+                            def _sigreg_samples(z):
+                                if config["SIGREG_PER_TIMESTEP"]:
+                                    return z
+                                return z.reshape((-1, z.shape[-1]))
+
                             if config["SIGREG_TARGET"] == "hidden":
-                                shared_hidden_flat = shared_hidden.reshape(
-                                    (-1, shared_hidden.shape[-1])
-                                )
+                                shared_hidden_flat = _sigreg_samples(shared_hidden)
                                 sigreg_z_mean = shared_hidden_flat.mean()
                                 sigreg_z_std = shared_hidden_flat.std()
                                 sigreg_hidden_loss = sliced_epps_pulley_loss(
@@ -400,9 +403,7 @@ def make_train(config):
                                 )
 
                             if config["SIGREG_TARGET"] in ("actor", "both"):
-                                actor_penultimate_flat = actor_penultimate.reshape(
-                                    (-1, actor_penultimate.shape[-1])
-                                )
+                                actor_penultimate_flat = _sigreg_samples(actor_penultimate)
                                 if config["SIGREG_TARGET"] == "actor":
                                     sigreg_z_mean = actor_penultimate_flat.mean()
                                     sigreg_z_std = actor_penultimate_flat.std()
@@ -414,9 +415,7 @@ def make_train(config):
                                 )
 
                             if config["SIGREG_TARGET"] in ("critic", "both"):
-                                critic_penultimate_flat = critic_penultimate.reshape(
-                                    (-1, critic_penultimate.shape[-1])
-                                )
+                                critic_penultimate_flat = _sigreg_samples(critic_penultimate)
                                 if config["SIGREG_TARGET"] == "critic":
                                     sigreg_z_mean = critic_penultimate_flat.mean()
                                     sigreg_z_std = critic_penultimate_flat.std()
@@ -430,7 +429,7 @@ def make_train(config):
                             if config["SIGREG_TARGET"] == "both":
                                 sigreg_z = jnp.concatenate(
                                     [actor_penultimate_flat, critic_penultimate_flat],
-                                    axis=0,
+                                    axis=-2,
                                 )
                                 sigreg_z_mean = sigreg_z.mean()
                                 sigreg_z_std = sigreg_z.std()
@@ -689,6 +688,11 @@ if __name__ == "__main__":
         type=str,
         choices=["hidden", "actor", "critic", "both"],
         default="hidden",
+    )
+    parser.add_argument(
+        "--sigreg_per_timestep",
+        action=argparse.BooleanOptionalAction,
+        default=False,
     )
     parser.add_argument("--checkpoint_root", type=str)
     parser.add_argument("--wandb_project", type=str)
