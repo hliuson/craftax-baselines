@@ -81,6 +81,23 @@ class ActorCriticRNN(nn.Module):
         )(obs)
         embedding = nn.relu(embedding)
 
+        for _ in range(self.config.get("RESMLP_BLOCKS", 0)):
+            h = nn.LayerNorm()(embedding)
+            h = nn.Dense(
+                self.config["LAYER_SIZE"],
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+            )(h)
+            h = nn.relu(h)
+            h = nn.Dense(
+                self.config["LAYER_SIZE"],
+                kernel_init=orthogonal(np.sqrt(2)),
+                bias_init=constant(0.0),
+            )(h)
+            embedding = embedding + h
+        if self.config.get("RESMLP_BLOCKS", 0) > 0:
+            embedding = nn.LayerNorm()(embedding)
+
         rnn_in = (embedding, dones)
         hidden, embedding = ScannedRNN()(hidden, rnn_in)
 
@@ -664,6 +681,7 @@ if __name__ == "__main__":
     )
     parser.add_argument("--num_repeats", type=int, default=1)
     parser.add_argument("--layer_size", type=int, default=512)
+    parser.add_argument("--resmlp_blocks", type=int, default=2)
     parser.add_argument("--sigreg_coef", type=float, default=0.0)
     parser.add_argument("--sigreg_num_slices", type=int, default=32)
     parser.add_argument(
